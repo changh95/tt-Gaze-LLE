@@ -15,6 +15,22 @@ only layout prep (zero-cost views) and upload/download.
 
 ---
 
+## Demo
+
+Four GazeFollow test-set images run end-to-end on a Blackhole p150a. Green box
+is the input head bounding box; yellow arrow and red × are the predicted gaze
+direction and target pixel; ``inout`` is the predicted in-frame score.
+Reproduce with ``python -m scripts.make_demo``.
+
+| Input (`media/source_N.png`) | Prediction (`media/target_N.png`) |
+|:---:|:---:|
+| ![](media/source_1.png) | ![](media/target_1.png) |
+| ![](media/source_2.png) | ![](media/target_2.png) |
+| ![](media/source_3.png) | ![](media/target_3.png) |
+| ![](media/source_4.png) | ![](media/target_4.png) |
+
+---
+
 ## Contents
 
 ```
