@@ -13,20 +13,31 @@ test, and a script to pull the weights and data.
 The TT-NN forward runs the **entire inference** on the chip — the host does
 only layout prep (zero-cost views) and upload/download.
 
-> **Scope:** This port supports **single-person gaze only** — one image and
-> one head bounding box per forward pass (``__call__`` asserts ``B == 1``). The
-> upstream Gaze-LLE model is natively multi-person (shared scene encode,
-> decoder-per-head), but that path is not yet wired up here; see
-> [Known caveats](#known-caveats).
+**Multi-person in one forward.** `TtGazeLLE(image, [bbox_a, bbox_b, …])` runs
+the DINOv2 backbone and the gaze projection **once**, then runs the
+bbox-conditioned decoder tail (head-mask build + 3 gaze blocks + heads) **once
+per head**, returning stacked per-head heatmaps and in/out scores
+(`(N, 64, 64)` and `(N,)`). `N = 1` keeps the old single-person contract.
 
 ---
 
 ## Demo
 
-Four GazeFollow test-set images run end-to-end on a Blackhole p150a. Green box
-is the input head bounding box; yellow arrow and red × are the predicted gaze
-direction and target pixel; ``inout`` is the predicted in-frame score.
-Reproduce with ``python -m scripts.make_demo``.
+Four multi-person scenes from the GazeFollow test set. Each pair follows the
+canonical Gaze-LLE inference pipeline from the
+[official Colab](https://colab.research.google.com/drive/1TSoyFvNs1-au9kjOZN_fo5ebdzngSPDq):
+
+1. **RetinaFace** detects every face in the image.
+2. The detected bboxes are fed into `TtGazeLLE(image, bboxes)` running on a
+   Blackhole p150a — the DINOv2 backbone + gaze projection run **once**, the
+   decoder tail runs **N times** over the shared scene features.
+
+Each colored bbox is one RetinaFace detection; the same-colored arrow and ×
+are that person's predicted gaze direction and target pixel. No bboxes are
+hand-picked — every one comes from the face detector.
+
+Reproduce with ``python -m scripts.make_demo``
+(requires ``pip install retina-face tf-keras``).
 
 | Input (`media/source_N.png`) | Prediction (`media/target_N.png`) |
 |:---:|:---:|
@@ -74,6 +85,17 @@ below.
    ```
 
    `torch` can be CPU-only; the reference is only used as a numerical shadow.
+
+   **Optional (multi-person demo + multi-person test):** the canonical
+   Gaze-LLE Colab pipeline feeds **RetinaFace**-detected head bboxes into the
+   model. If you want to run the multi-person path, also install:
+
+   ```bash
+   pip install retina-face tf-keras
+   ```
+
+   Without these, `scripts/make_demo.py` and `test_multi_person.py` skip the
+   multi-person steps with a clear message; everything else still works.
 3. Point Python at tt-metal's `ttnn` bindings and set the few env vars the TT-NN
    runtime expects:
 
@@ -242,15 +264,25 @@ branch commit history that produced this repo.
 
 ## Known caveats
 
-- **Single-person gaze only (no multi-person inference).** `TtGazeLLE.__call__`
-  asserts `B == 1` and takes exactly one head bounding box per forward. The
-  heatmap reshape and the inout-token concat both hard-code one head. The
-  upstream Gaze-LLE model is natively multi-person — it encodes the scene
-  once and runs the 3 gaze-decoder blocks + heads once per head bbox, so the
-  marginal per-head cost is small. Splitting `__call__` into
-  `_encode_scene(image)` and `_decode_head(scene_features, bbox)` would enable
-  that here without re-running the DINOv2 backbone; it's the first item in the
-  upstream branch's `TODO.md`.
+- **One image per forward.** `TtGazeLLE.__call__` asserts `B == 1`. Multiple
+  heads in the same image are supported by passing a list of bboxes and share
+  the scene encode; multiple **images** in the same forward (true batching)
+  would require staging the image upload and backbone matmuls as batched
+  shapes — not wired up yet.
+- **Per-head decoder runs serially on device.** `N` heads dispatch the decoder
+  tail (head-mask + 3 gaze blocks + heads) `N` times in sequence rather than
+  as one batched-along-N tail. For typical `N ≤ 10` this is well under the
+  backbone cost, but fusing the tail into a single `(N, 1024, 256)` pass
+  would further cut per-head dispatch overhead.
+- **Multi-person output equals single-person output (bit-exact).** Running
+  `TtGazeLLE(image, [bbox_a, bbox_b])` returns output `[0]` that is
+  **numerically identical** to `TtGazeLLE(image, [bbox_a])` — i.e. the
+  per-head decoder does not interfere between heads. Against a torch
+  reference on the same pretrained weights, per-head PCC sits at the same
+  ~0.99 as single-person mode. The test suite's looser 0.95 bar on
+  `test_multi_person.py` is because that test uses non-face-centered bboxes
+  for the purpose of exercising the N-head code path; numerical equivalence
+  is verified by `pcc(tt_single, tt_multi) == 1.0000`.
 - **Random-weight PCC is the numerical baseline.** Real pretrained weights
   change absolute activations but the stage-relative PCC pattern is the same.
   Run both `test_relative_pcc.py` and `test_pretrained_eval.py` to cover both.
