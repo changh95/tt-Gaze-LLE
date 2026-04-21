@@ -1,19 +1,17 @@
 # tt-Gaze-LLE
 
-End-to-end port of [Gaze-LLE](https://github.com/fkryan/gazelle) (Ryan et al.) to
-Tenstorrent's tt-metallium SDK, running on a **single Blackhole p150a** chip.
+End-to-end port of [Gaze-LLE](https://github.com/fkryan/gazelle) (Ryan et al.)
+to Tenstorrent **tt-metal** (tt-nn + tt-metallium), running on a single
+Blackhole p150a chip.
 
-Gaze-LLE takes an image and a head bounding box and predicts a 64×64 heatmap of
-where that person is looking, plus a scalar in-frame/out-of-frame score. This
-repository contains the TT-NN implementation of the `gazelle_dinov2_vitb14_inout`
-variant (DINOv2 ViT-B/14 backbone + 3-layer gaze decoder at 448×448 input), a
-torch reference used as a numerical shadow, tests for per-stage PCC + GazeFollow
-AUC/L2, a micro-benchmark harness for Tracy, and a script to pull all the
-weights and data.
+This repository contains a TT-NN implementation of the
+`gazelle_dinov2_vitb14_inout` checkpoint, a torch reference used as a numerical
+shadow, pytest suites for per-stage PCC and real-image correctness, a
+GazeFollow AUC/L2 evaluator, a wall-clock benchmark, a Tracy-profileable perf
+test, and a script to pull the weights and data.
 
-The TT-NN forward runs the **entire inference** — patch embedding, 12 DINOv2
-encoder blocks, gaze decoder, heatmap head, and in/out MLP — on the chip.
-The host does only layout prep (zero-cost views) and upload/download.
+The TT-NN forward runs the **entire inference** on the chip — the host does
+only layout prep (zero-cost views) and upload/download.
 
 ---
 
@@ -174,18 +172,6 @@ latency.
 | Device ops per forward (Tracy)   | 202 |
 | Per-frame host→device upload      | 1.18 MB (bf16) |
 | Per-frame device→host download    | 16 KB + 4 B (heatmap + inout) |
-
-Tracy per-op breakdown (captured forward, ~14.7 ms under Tracy overhead):
-
-| Op | Count | % of device span |
-|---|---:|---:|
-| MatmulDeviceOperation                     | 65 | 24.3% |
-| SDPAOperation                             | 15 | 22.8% |
-| NLPConcatHeadsDeviceOperation             | 15 | 17.0% |
-| BinaryNgDeviceOperation (add / mul)       | 42 | 11.9% |
-| LayerNormDeviceOperation                  | 31 |  5.9% |
-| NlpCreateHeadsDeviceOperation (qkv split) | 15 |  3.9% |
-| other (slice, tilize, sigmoid, …)         | 19 |  ~2%  |
 
 ### Optimization trajectory
 
