@@ -13,6 +13,12 @@ test, and a script to pull the weights and data.
 The TT-NN forward runs the **entire inference** on the chip — the host does
 only layout prep (zero-cost views) and upload/download.
 
+> **Scope:** This port supports **single-person gaze only** — one image and
+> one head bounding box per forward pass (``__call__`` asserts ``B == 1``). The
+> upstream Gaze-LLE model is natively multi-person (shared scene encode,
+> decoder-per-head), but that path is not yet wired up here; see
+> [Known caveats](#known-caveats).
+
 ---
 
 ## Demo
@@ -236,9 +242,15 @@ branch commit history that produced this repo.
 
 ## Known caveats
 
-- **Batch size 1 only.** `TtGazeLLE.__call__` asserts `B == 1` — the heatmap
-  reshape and the inout-token concat assume a single person per forward. Adding
-  multi-person / multi-image batching is a follow-up.
+- **Single-person gaze only (no multi-person inference).** `TtGazeLLE.__call__`
+  asserts `B == 1` and takes exactly one head bounding box per forward. The
+  heatmap reshape and the inout-token concat both hard-code one head. The
+  upstream Gaze-LLE model is natively multi-person — it encodes the scene
+  once and runs the 3 gaze-decoder blocks + heads once per head bbox, so the
+  marginal per-head cost is small. Splitting `__call__` into
+  `_encode_scene(image)` and `_decode_head(scene_features, bbox)` would enable
+  that here without re-running the DINOv2 backbone; it's the first item in the
+  upstream branch's `TODO.md`.
 - **Random-weight PCC is the numerical baseline.** Real pretrained weights
   change absolute activations but the stage-relative PCC pattern is the same.
   Run both `test_relative_pcc.py` and `test_pretrained_eval.py` to cover both.
