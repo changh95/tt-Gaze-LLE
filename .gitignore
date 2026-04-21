@@ -1,0 +1,33 @@
+# Downloaded weights and datasets (pulled by scripts/download_data.sh)
+weights/
+data/
+eval_artifacts/
+*.pth
+*.pt
+*.parquet
+
+# tt-metal / ttnn caches / logs
+generated/
+tracy_out/
+*.tracy
+.logs/
+run.log
+tracy.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OMC / runtime state (shouldn't be tracked)
+.omc/
