@@ -27,7 +27,9 @@ def _gc_between_tests():
 def device():
     import ttnn
 
+    from gaze_lle.tt.tt_gaze_lle import open_device_kwargs  # trace region on the fused default; {} with TT_FUSED=0
+
     device_id = int(os.environ.get("GAZE_LLE_DEVICE", "0"))
-    dev = ttnn.open_device(device_id=device_id)
+    dev = ttnn.open_device(device_id=device_id, **open_device_kwargs())
     yield dev
     ttnn.close_device(dev)

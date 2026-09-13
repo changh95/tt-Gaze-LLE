@@ -13,6 +13,8 @@ Defaults to ViT-B/14 backbone at 448x448 with single-person head bbox.
 Runs either the pure torch reference (``--impl torch``) or the TT-NN
 implementation (``--impl ttnn``). In ttnn mode we additionally compute PCC of
 the predicted heatmap versus the torch reference to report ``accuracy``.
+The fused/traced pipeline is the default (the device is opened with a trace region and
+the traces are captured before the timed loop); ``TT_FUSED=0`` benchmarks the legacy path.
 """
 
 from __future__ import annotations
@@ -77,7 +79,7 @@ def run_torch_benchmark(variant: str, iters: int, warmup: int, inout: bool) -> d
 def run_ttnn_benchmark(variant: str, iters: int, warmup: int, inout: bool, device_id: int) -> dict:
     import ttnn
 
-    from gaze_lle.tt.tt_gaze_lle import TtGazeLLE
+    from gaze_lle.tt.tt_gaze_lle import TtGazeLLE, open_device_kwargs
 
     torch.manual_seed(0)
     ref_model = build_gaze_lle(variant=variant, inout=inout).eval()
@@ -87,9 +89,12 @@ def run_ttnn_benchmark(variant: str, iters: int, warmup: int, inout: bool, devic
     with torch.no_grad():
         ref_out = ref_model(ref_img, bboxes)
 
-    device = ttnn.open_device(device_id=device_id)
+    # Bare open_device on the legacy path (TT_FUSED=0); the fused default adds the trace region it needs.
+    device = ttnn.open_device(device_id=device_id, **open_device_kwargs())
     try:
         tt_model = TtGazeLLE(ref_model, device, inout=inout)
+        if getattr(tt_model, "fused", False):
+            tt_model.warmup(heads=[len(bboxes)])  # capture the trace outside the timed loop
 
         for _ in range(warmup):
             tt_out = tt_model(ref_img, bboxes)

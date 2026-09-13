@@ -158,9 +158,10 @@ def main():
     print(f"GazeFollow test set: {n_total} images; evaluating {n_eval}")
 
     import ttnn
+    from gaze_lle.tt.tt_gaze_lle import open_device_kwargs  # trace region on the fused default; {} with TT_FUSED=0
     device = None
     if not args.skip_tt:
-        device = ttnn.open_device(device_id=args.device_id)
+        device = ttnn.open_device(device_id=args.device_id, **open_device_kwargs())
 
     try:
         ref, tt_model = load_models(device)

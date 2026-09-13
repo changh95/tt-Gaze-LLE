@@ -23,6 +23,10 @@ Stages captured:
     heatmap_compact             — fused ConvT + Conv + sigmoid (pre-view-reshape)
     inout_scalar                — in/out MLP output after sigmoid
     heatmap                     — final (B, 64, 64) heatmap after host reshape
+
+With ``TT_FUSED=1`` the same thresholds apply to the fused pipeline (captures are rotated
+back to the legacy token order by the model); ``patch_embed`` and ``after_slice`` do not
+exist as separate stages there and are skipped.
 """
 
 from __future__ import annotations
@@ -215,12 +219,22 @@ def test_relative_pcc(device, variant, capsys):
     tt_stages = {}
     _ = tt_model(image, bboxes, captures=tt_stages)
 
+    # TT_FUSED=1: the fused graph has no separate patch_embed (bias/pos/CLS are folded into one
+    # op) and no CLS slice (the gated projection drops it); every other stage is captured under
+    # its legacy name/shape (special token rotated back to row 0, patch rows only, first head).
+    fused = getattr(tt_model, "fused", False)
+    skipped = {"patch_embed", "after_slice"} if fused else set()
+
     # Verify shapes match and PCCs pass.
     with capsys.disabled():
         print("\n{:30s} {:>7s} {:>20s} {:>20s}".format("stage", "pcc", "shape (torch)", "shape (tt)"))
     failures = []
     for key, thresh in _STAGE_THRESHOLDS.items():
         assert key in torch_stages, f"torch shadow missing stage {key!r}"
+        if key in skipped and key not in tt_stages:
+            with capsys.disabled():
+                print(f"  --  {key:26s} {'n/a':>7s} (not a separate stage on the TT_FUSED path)")
+            continue
         assert key in tt_stages, f"tt captures missing stage {key!r}"
         t = torch_stages[key]
         d = tt_stages[key]

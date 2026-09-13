@@ -20,16 +20,81 @@ Device placement:
   * Fused ConvTranspose2d(256,256,2,2) + Conv2d(256,1,1) + Sigmoid heatmap head,
     expressed as a single (256,4) matmul + scalar add + sigmoid.
   * In/out MLP (256->128->1) with ReLU + Sigmoid.
+
+The above is the LEGACY path (``TT_FUSED=0``; eager, per-head decoder, 201 device ops at N=1 and
+57 more per extra head, two readbacks per head). It is bit-for-bit what shipped in the first
+package and is not touched by the knob below.
+
+The fused pipeline below is the DEFAULT since its device validation on 2026-09-13
+(``DEVICE_VALIDATION.md`` "Results"; ``TT_FUSED`` unset or ``1``; read ONCE in
+``TtGazeLLE.__init__``, see ``fused_math.FusedConfig``), built for the whole-graph metal trace:
+
+  * Host: bf16 im2col into a persistent ROW_MAJOR (1, 1025, 608) buffer (zero CLS row 1024,
+    zero pad cols) -> ``copy_host_to_device_tensor``; device ``tilize_with_zero_padding``
+    replaces the ~0.8 ms host tilize (exact).
+  * Token layout ``[patches, CLS]`` / ``[patches, inout]`` (special token at row 1024, exact by
+    permutation equivariance) so the tile-padded ``concat`` (4 ops) and unaligned ``slice``
+    (3 ops) fallbacks disappear.
+  * Patch-embed + conv bias + pos-embed + CLS as ONE ``dit_minimal_matmul_addcmul_fused``
+    (``C_patch + 1.0 * (X @ W_patch) * ones``); proj+residual and fc2+residual of every backbone
+    and gaze block as one fused op each (11 -> 9 ops per block); the 768->256 projection +
+    gaze pos + bias + inout token as ONE gated fused op (``C2 + (x @ W_proj) * G``).
+  * Head conditioning from a host-built (N, 1025, 1) mask (``mul`` + ``add``), and all N heads
+    batched through the decoder once as (N, 1025, 256): 57*N -> 32 ops for any N.
+  * Heads as 3 ops: ``relu(x @ W1 + b1)``, ``minimal_matmul([x, h], blockdiag(W_hm, W_io2), bias)``,
+    ``sigmoid`` -> ONE (N, 1025, 5) readback (heatmap rows 0..1023 cols 0..3, in/out row 1024
+    col 4). ``TT_FUSED_HEAD=fused`` folds the sigmoid into the matmul (measured no faster).
+  * ``SDPAProgramConfig`` chunks (q 128 / k 128, exact exp) instead of the 32/32 defaults.
+  * Scene trace (once) + one decoder trace per head-count bucket (``TT_FUSED_TRACE_HEADS``,
+    default 1,2,3,4,6,8,10; other N are padded up by repeating the last bbox); ``warmup()``
+    captures them before the server reports READY. 144 device ops for any N (legacy 201/315/714
+    at N = 1/3/10), 1 upload + 1 mask upload + 1 readback. ``TT_FUSED_EAGER=1`` runs the same
+    graph eagerly; every fusion has a legacy-op fallback knob (``fused_math.FusedConfig``).
 """
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
 
 import ttnn
+
+from gaze_lle.tt.fused_math import (
+    FusedConfig,
+    build_fused_head,
+    build_gated_proj_consts,
+    build_head_mask,
+    build_heatmap_head,
+    build_inout_head,
+    build_patch_const,
+    build_patch_weight,
+    build_proj_weight,
+    decode_head_output,
+    decode_legacy_head_outputs,
+    fill_im2col,
+    fused_to_legacy_order,
+    pad_bboxes,
+    pad_to_tile,
+    pick_bucket,
+    select_forward_path,
+)
+
+
+def open_device_kwargs(cfg: Optional[FusedConfig] = None) -> dict:
+    """Extra ``ttnn.open_device`` kwargs for this model.
+
+    Legacy path (``TT_FUSED=0``): ``{}`` -- its validated recipe is a bare ``open_device(device_id=...)``.
+    Fused path (default) with tracing on: ``{"trace_region_size": TT_FUSED_TRACE_REGION_MB << 20}``,
+    because ``ttnn.device.DEFAULT_TRACE_REGION_SIZE`` is 0 in this tree and a bare device
+    cannot capture a trace. Every device-opening entry point (server, benchmark, conftest,
+    scripts) spreads this into its ``open_device`` call.
+    """
+    cfg = FusedConfig.from_env() if cfg is None else cfg
+    if cfg.enabled and cfg.trace:
+        return {"trace_region_size": int(cfg.trace_region_mb) * 1024 * 1024}
+    return {}
 
 
 def _to_device(t: torch.Tensor, device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT) -> ttnn.Tensor:
@@ -174,7 +239,565 @@ def _gaze_block(x, p: _GazeBlockParams, num_heads: int):
     return ttnn.add(x, h)
 
 
-class TtGazeLLE:
+# ======================================================================================
+# TT_FUSED=1 path. The legacy classes/functions above and TtGazeLLE below are unchanged
+# except for the knob dispatch in TtGazeLLE.__init__ / __call__ (and the mixin base class).
+# ======================================================================================
+
+
+def _compute_config(device, fidelity: str, fp32_acc: bool = False, packer_l1_acc: bool = False):
+    """Explicit compute config (the fused ops default to HiFi2 + fp32 accumulation otherwise)."""
+    return ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=getattr(ttnn.MathFidelity, fidelity),
+        math_approx_mode=True,
+        fp32_dest_acc_en=fp32_acc,
+        packer_l1_acc=packer_l1_acc,
+    )
+
+
+class _FusedRuntime:
+    """Device-side knobs of the fused graph: memory placement, kernel configs, fused-op helpers.
+
+    Constraints baked in (from the op sources of this tree, see DEVICE_VALIDATION.md):
+      * ``dit_minimal_matmul_addcmul_fused``: residual (ternary_a) data format == weight format
+        (program factory ``ternary_a_data_format == in1_data_format``) -> bf16 weights for every
+        fused matmul; residual and scale vector in the SAME buffer type (L1 / DRAM); explicit
+        4x4x4 blocks / 2x2 subblocks (the 8x8x8 default clashed L1 on p150 for rf-detr).
+      * ``minimal_matmul`` fused K-concat: exactly [prefix, suffix], same dtype/leading dims,
+        prefix_padded_K + suffix_padded_K == weight_padded_K; fused_activation and ternary are
+        mutually exclusive.
+      * SDPA: chunk sizes % 32 == 0; no explicit padding mask (the kernel masks keys >= logical S).
+    """
+
+    def __init__(self, device, cfg: FusedConfig):
+        self.device = device
+        self.cfg = cfg
+        self.mem = ttnn.L1_MEMORY_CONFIG if cfg.l1 else None
+        grid = device.compute_with_storage_grid_size()
+        self.grid = grid
+        # Fused matmuls: LoFi like the legacy linears unless TT_FUSED_FIDELITY says otherwise.
+        self.mm_compute = _LOFI if cfg.fidelity == "LoFi" else _compute_config(device, cfg.fidelity)
+        # Heads: HiFi2 (the legacy in/out linears ran HiFi2: no user grid, bf16 inputs).
+        self.head_compute = _compute_config(device, "HiFi2")
+        self.dit_config = ttnn.MinimalMatmulConfig(  # proj [.,768]x[768,768], fc2 [.,3072]x[3072,768], patch, gated proj
+            M_block_size=4, K_block_size=4, N_block_size=4, subblock_h=2, subblock_w=2,
+            compute_with_storage_grid_size=grid,
+        )
+        self.mm_config = ttnn.MinimalMatmulConfig(  # qkv [.,768]x[768,2304], fc1 [.,768]x[768,3072] (TT_FUSED_MINIMAL_MM=1)
+            M_block_size=8, K_block_size=4, N_block_size=4, subblock_h=2, subblock_w=2,
+            compute_with_storage_grid_size=grid,
+        )
+        self.sdpa_pc = (
+            ttnn.SDPAProgramConfig(
+                compute_with_storage_grid_size=grid,
+                q_chunk_size=cfg.sdpa_q,
+                k_chunk_size=cfg.sdpa_k,
+                exp_approx_mode=not cfg.sdpa_exact_exp,
+            )
+            if cfg.sdpa_pc
+            else None
+        )
+        # Fused sigmoid params = ttnn.sigmoid defaults (vector mode RC=4, accurate mode): the same
+        # SFPU kernel, so "fused" and "separate" should agree; A/B on device (TT_FUSED_HEAD).
+        self.sigmoid_act = ttnn.UnaryWithParam(ttnn.UnaryOpType.SIGMOID, 4.0, 0.0)
+        self._ones_dram: Dict[int, ttnn.Tensor] = {}
+        self._ones_l1: Dict[int, ttnn.Tensor] = {}
+        self._frozen = False
+
+    # ---- constants -------------------------------------------------------------------
+    def preallocate(self, widths: Sequence[int]) -> None:
+        """Materialise every constant BEFORE any trace capture, then refuse new ones.
+
+        A device buffer allocated AFTER a capture can land on an address that trace's (freed)
+        intermediates use, and the next replay of that trace overwrites it. Measured on the p150a
+        (2026-09-13): ``ones(256)`` created lazily inside the decoder warm-up run, i.e. after the
+        scene capture, was clobbered by the scene replay -> gaze-block PCC 0.76 / heatmap 0.57 on
+        every later call (eager or traced), while ``ones(768)`` (created before the capture) was fine.
+        """
+        for w in widths:
+            self.ones(int(w))
+            if self.cfg.l1:
+                self.ones(int(w), l1=True)
+        self._frozen = True
+
+    def ones(self, width: int, l1: bool = False) -> ttnn.Tensor:
+        """(1, 1, width) bf16 ones vector = the addcmul scale of a plain residual add."""
+        table = self._ones_l1 if l1 else self._ones_dram
+        if width not in table:
+            if self._frozen:
+                raise RuntimeError(
+                    f"ones({width}, l1={l1}) requested after preallocate(): allocating a constant after a "
+                    "trace capture can alias the trace's intermediates (see preallocate); add the width there"
+                )
+            if l1:
+                table[width] = ttnn.to_memory_config(self.ones(width, l1=False), ttnn.L1_MEMORY_CONFIG)
+            else:
+                table[width] = ttnn.from_torch(
+                    torch.ones(1, 1, width), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    device=self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+        return table[width]
+
+    def ones_for(self, residual: ttnn.Tensor, width: int) -> ttnn.Tensor:
+        """Ones vector in the residual's buffer type (the fused kernel compiles ONE accessor type)."""
+        in_l1 = residual.memory_config().buffer_type == ttnn.BufferType.L1
+        return self.ones(width, l1=in_l1)
+
+    # ---- fused-op helpers ------------------------------------------------------------
+    def matmul(self, h, w, b, activation=None, compute=None):
+        """h @ w + b [+ activation] (qkv, fc1): legacy ``ttnn.linear`` or ``minimal_matmul`` (knob)."""
+        if self.cfg.minimal_mm:
+            y = ttnn.experimental.minimal_matmul(
+                h, w, bias_tensor=b, config=self.mm_config, memory_config=self.mem,
+                compute_kernel_config=self.mm_compute,
+            )
+            if activation == "gelu":
+                y = ttnn.gelu(y, fast_and_approximate_mode=False, memory_config=self.mem)  # exact, like linear's "gelu"
+            elif activation is not None:
+                raise ValueError(f"unsupported activation {activation!r} for the minimal_matmul path")
+            return y
+        return ttnn.linear(
+            h, w, bias=b, activation=activation, core_grid=_CORE_GRID,
+            compute_kernel_config=compute, memory_config=self.mem,
+        )
+
+    def matmul_residual(self, h, w, b, residual, compute=None):
+        """residual + (h @ w + b) (proj, fc2): one fused op, or linear + add (TT_FUSED_DIT=0)."""
+        if self.cfg.dit:
+            return ttnn.experimental.dit_minimal_matmul_addcmul_fused(
+                h, w, 1.0, residual, self.ones_for(residual, w.shape[-1]),
+                bias_tensor=b, config=self.dit_config, memory_config=self.mem,
+                compute_kernel_config=self.mm_compute,
+            )
+        y = ttnn.linear(h, w, bias=b, core_grid=_CORE_GRID, compute_kernel_config=compute, memory_config=self.mem)
+        return ttnn.add(residual, y, memory_config=self.mem)
+
+
+class _FusedBlockParams:
+    """On-device weights of one DINOv2 block for the fused path (LayerScale folded like legacy).
+
+    qkv / fc1 stay bfp8 (bf16 with TT_FUSED_BF16_WEIGHTS=1); proj / fc2 are bf16 whenever the
+    fused matmul+residual op is on (its residual/weight data formats must match), else bfp8 like legacy.
+    """
+
+    def __init__(self, block, device, cfg: FusedConfig):
+        wdt = ttnn.bfloat16 if cfg.bf16_weights else ttnn.bfloat8_b
+        res_wdt = ttnn.bfloat16 if cfg.dit else wdt
+        self.norm1_w = _to_device(block.norm1.weight.unsqueeze(0), device)
+        self.norm1_b = _to_device(block.norm1.bias.unsqueeze(0), device)
+        self.qkv_w = _to_device(block.attn.qkv.weight.T.contiguous(), device, dtype=wdt)
+        self.qkv_b = _to_device(block.attn.qkv.bias.unsqueeze(0), device)
+        ls1 = block.ls1.gamma.detach()
+        proj_w = block.attn.proj.weight.detach() * ls1.unsqueeze(-1)
+        proj_b = block.attn.proj.bias.detach() * ls1
+        self.proj_w = _to_device(proj_w.T.contiguous(), device, dtype=res_wdt)
+        self.proj_b = _to_device(proj_b.unsqueeze(0), device)
+        self.norm2_w = _to_device(block.norm2.weight.unsqueeze(0), device)
+        self.norm2_b = _to_device(block.norm2.bias.unsqueeze(0), device)
+        self.fc1_w = _to_device(block.mlp.fc1.weight.T.contiguous(), device, dtype=wdt)
+        self.fc1_b = _to_device(block.mlp.fc1.bias.unsqueeze(0), device)
+        ls2 = block.ls2.gamma.detach()
+        fc2_w = block.mlp.fc2.weight.detach() * ls2.unsqueeze(-1)
+        fc2_b = block.mlp.fc2.bias.detach() * ls2
+        self.fc2_w = _to_device(fc2_w.T.contiguous(), device, dtype=res_wdt)
+        self.fc2_b = _to_device(fc2_b.unsqueeze(0), device)
+
+
+def _fused_dinov2_block(x, p: _FusedBlockParams, rt: _FusedRuntime, num_heads: int):
+    """One DINOv2 block on (1, 1025, 768) in the fused layout: 9 ops (11 legacy).
+
+    LN, qkv, split heads, SDPA (program config), concat heads, proj+residual (fused),
+    LN, fc1+gelu, fc2+residual (fused).
+    """
+    mem = rt.mem
+    h = ttnn.layer_norm(x, weight=p.norm1_w, bias=p.norm1_b, epsilon=1e-6, memory_config=mem)
+    head_dim = h.shape[-1] // num_heads
+    qkv = rt.matmul(h, p.qkv_w, p.qkv_b, compute=_LOFI)
+    ttnn.deallocate(h)
+    q, k, v = ttnn.transformer.split_query_key_value_and_split_heads(
+        qkv, num_heads=num_heads, transpose_key=False, memory_config=mem
+    )
+    ttnn.deallocate(qkv)
+    ctx = ttnn.transformer.scaled_dot_product_attention(
+        q, k, v, is_causal=False, scale=1.0 / (head_dim ** 0.5), program_config=rt.sdpa_pc, memory_config=mem
+    )
+    ttnn.deallocate(q)
+    ttnn.deallocate(k)
+    ttnn.deallocate(v)
+    ctx = ttnn.transformer.concatenate_heads(ctx, memory_config=mem)
+    x = rt.matmul_residual(ctx, p.proj_w, p.proj_b, x, compute=_LOFI)
+    ttnn.deallocate(ctx)
+
+    h = ttnn.layer_norm(x, weight=p.norm2_w, bias=p.norm2_b, epsilon=1e-6, memory_config=mem)
+    h = rt.matmul(h, p.fc1_w, p.fc1_b, activation="gelu", compute=_LOFI)
+    x = rt.matmul_residual(h, p.fc2_w, p.fc2_b, x, compute=_LOFI)
+    ttnn.deallocate(h)
+    return x
+
+
+class _FusedGazeBlockParams(_GazeBlockParams):
+    """Gaze-decoder block weights for the fused path (all bf16 already, same as legacy)."""
+
+    def __init__(self, block, device, cfg: FusedConfig):
+        super().__init__(block, device)
+
+
+def _fused_gaze_block(x, p: _GazeBlockParams, rt: _FusedRuntime, num_heads: int):
+    """One gaze block on (N, 1025, 256), all N heads batched: 9 ops (11 legacy).
+
+    The non-fused matmuls are called exactly like the legacy block (core_grid, no explicit
+    compute config => LoFi) so an A/B isolates the fused ops.
+    """
+    mem = rt.mem
+    h = ttnn.layer_norm(x, weight=p.norm1_w, bias=p.norm1_b, epsilon=1e-6, memory_config=mem)
+    head_dim = h.shape[-1] // num_heads
+    qkv = rt.matmul(h, p.qkv_w, p.qkv_b)
+    q, k, v = ttnn.transformer.split_query_key_value_and_split_heads(
+        qkv, num_heads=num_heads, transpose_key=False, memory_config=mem
+    )
+    ttnn.deallocate(qkv)
+    ctx = ttnn.transformer.scaled_dot_product_attention(
+        q, k, v, is_causal=False, scale=1.0 / (head_dim ** 0.5), program_config=rt.sdpa_pc, memory_config=mem
+    )
+    ttnn.deallocate(q)
+    ttnn.deallocate(k)
+    ttnn.deallocate(v)
+    ctx = ttnn.transformer.concatenate_heads(ctx, memory_config=mem)
+    x = rt.matmul_residual(ctx, p.proj_w, p.proj_b, x)
+    ttnn.deallocate(ctx)
+
+    h = ttnn.layer_norm(x, weight=p.norm2_w, bias=p.norm2_b, epsilon=1e-6, memory_config=mem)
+    h = rt.matmul(h, p.fc1_w, p.fc1_b, activation="gelu")
+    x = rt.matmul_residual(h, p.fc2_w, p.fc2_b, x)
+    ttnn.deallocate(h)
+    return x
+
+
+WARMUP_BBOX = (0.3, 0.2, 0.6, 0.5)  # the bbox every harness in the port warms with
+
+
+class _FusedMixin:
+    """The TT_FUSED=1 implementation of :class:`TtGazeLLE` (its base class; see __init__ dispatch).
+
+    Persistent device state and the trace contract:
+
+      * ``_in_dev``      ROW_MAJOR bf16 (1, 1025, 608) im2col upload buffer (allocated first).
+      * ``_x_base``      the scene trace's output (1, 1025, 256) -- lives as long as the trace.
+      * ``_dec[n]``      per head-count bucket: the decoder trace id, its TILE bf16 (n, 1025, 1)
+                         mask upload buffer and its output tensor(s).
+
+    Order per inference (must not change): upload im2col -> execute scene trace -> upload mask ->
+    execute decoder trace -> read outputs. Intermediates of a captured trace live at baked
+    addresses that later-allocated persistent buffers (other buckets' masks/outputs) may reuse, so
+    every persistent buffer is (re)written after the trace that could clobber it and read before
+    the next one runs. Nothing is allocated between capture and replay except through this class.
+    """
+
+    # ------------------------------------------------------------------ construction
+    def _init_fused(self, ref_model, device):
+        cfg: FusedConfig = self.fused_cfg
+        self._rt = _FusedRuntime(device, cfg)
+        backbone = ref_model.backbone
+        if hasattr(device, "enable_program_cache"):
+            device.enable_program_cache()
+
+        self.seq_len = self.num_patches + 1  # patches + one special token (row num_patches)
+        self.k_patch = self.patch_size * self.patch_size * 3
+        self.k_patch_pad = pad_to_tile(self.k_patch)
+
+        self.block_params = [_FusedBlockParams(blk, device, cfg) for blk in backbone.blocks]
+        self.final_norm_w = _to_device(backbone.norm.weight.unsqueeze(0), device)
+        self.final_norm_b = _to_device(backbone.norm.bias.unsqueeze(0), device)
+
+        # Patch embed as ONE fused op: C_patch + 1.0 * (X_pad @ W_pad) * ones. W must be bf16 when
+        # fused (format rule); the linear+add fallback keeps the legacy bfp8 weight.
+        self.patch_embed_w = _to_device(build_patch_weight(backbone), device,
+                                        dtype=ttnn.bfloat16 if cfg.dit else ttnn.bfloat8_b)
+        self.patch_const = _to_device(build_patch_const(backbone), device)  # (1, S, 768), DRAM
+        self.patch_embed_b = None  # folded into patch_const
+        self.prefix_tt = None      # no concat in the fused layout
+        self.pos_patches_tt = None
+
+        # Gated projection: X_base = C2 + 1.0 * (x_final @ W_proj) * G.
+        self.proj_w = _to_device(build_proj_weight(ref_model), device)
+        c2, gate = build_gated_proj_consts(ref_model)
+        self.proj_c2 = _to_device(c2, device)      # (1, S, 256), DRAM (ternary_a)
+        self.proj_gate = _to_device(gate, device)  # (1, S, 256), DRAM (ternary_b, full [M, N])
+        self.head_token_tt = _to_device(ref_model.head_token.weight.unsqueeze(0), device)  # (1, 1, 256)
+
+        self.gaze_block_params = [_FusedGazeBlockParams(blk, device, cfg) for blk in ref_model.transformer]
+
+        w1, b1, w2, b2 = build_inout_head(ref_model)
+        self.inout_fc1_w = _to_device(w1, device)
+        self.inout_fc1_b = _to_device(b1, device)
+        if cfg.head == "legacy":
+            self.inout_fc2_w = _to_device(w2, device)
+            self.inout_fc2_b = _to_device(b2, device)
+            hm_w, hm_b = build_heatmap_head(ref_model)
+            self.heatmap_w = _to_device(hm_w, device)
+            self.heatmap_b_tt = _to_device(torch.full((1, 1, 1), float(hm_b)), device)
+        else:
+            w_head, b_head = build_fused_head(ref_model)
+            self.head_w = _to_device(w_head, device)  # (384, 5) block-diagonal, bf16
+            self.head_b = _to_device(b_head, device)  # (1, 5)
+
+        # Every device constant must exist BEFORE the first trace capture (allocator aliasing, see
+        # _FusedRuntime.preallocate): the ones vectors of the backbone (768) and decoder (256) widths.
+        self._rt.preallocate((self.embed_dim, self.dim))
+
+        # Persistent host im2col buffer: bf16, zero CLS row and zero pad columns never written.
+        self._im2col_buf = torch.zeros(1, self.seq_len, self.k_patch_pad, dtype=torch.bfloat16)
+        self._in_dev = None
+        self._x_base = None
+        self._scene_trace = None
+        self._dec: Dict[int, dict] = {}
+
+    # ------------------------------------------------------------------ host work
+    def _host_input(self, images: torch.Tensor) -> ttnn.Tensor:
+        """im2col into the persistent bf16 buffer -> host ROW_MAJOR ttnn tensor (no host tilize)."""
+        fill_im2col(self._im2col_buf, images.float(), self.num_patches_side, self.patch_size)
+        return ttnn.from_torch(self._im2col_buf, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    def _host_mask(self, bboxes) -> ttnn.Tensor:
+        """(N, S, 1) bf16 TILE head mask (row S-1 = 0), tilized on host (68 KB per head)."""
+        m = build_head_mask(bboxes, self.featmap_h, self.featmap_w, self.seq_len).to(torch.bfloat16)
+        return ttnn.from_torch(m, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+    # ------------------------------------------------------------------ device graph
+    def _fused_scene_graph(self, in_dev, cap=None):
+        """Persistent RM im2col buffer -> X_base (1, S, 256): tilize + fused patch-embed + 12 blocks
+        + final LN + gated projection. 1 + 1 + 12*9 + 1 + 1 = 112 ops (legacy 144 + host tilize)."""
+        rt = self._rt
+        mem = rt.mem
+        x = ttnn.tilize_with_zero_padding(in_dev, memory_config=mem, use_multicore=True)  # (1, S, 608) TILE
+        if rt.cfg.dit:
+            x = ttnn.experimental.dit_minimal_matmul_addcmul_fused(
+                x, self.patch_embed_w, 1.0, self.patch_const, rt.ones(self.embed_dim),
+                bias_tensor=None, config=rt.dit_config, memory_config=mem, compute_kernel_config=rt.mm_compute,
+            )
+        else:
+            y = ttnn.linear(x, self.patch_embed_w, bias=None, core_grid=_CORE_GRID,
+                            compute_kernel_config=_LOFI, memory_config=mem)
+            x = ttnn.add(y, self.patch_const, memory_config=mem)
+        if cap:
+            cap("after_prefix", x, order="fused")
+
+        for i, bp in enumerate(self.block_params):
+            x = _fused_dinov2_block(x, bp, rt, self.num_heads)
+            if cap and i in (0, 5, 11):
+                cap(f"after_block_{i}", x, order="fused")
+        x = ttnn.layer_norm(x, weight=self.final_norm_w, bias=self.final_norm_b, epsilon=1e-6, memory_config=mem)
+        if cap:
+            cap("after_final_norm", x, order="fused")
+
+        if rt.cfg.dit:
+            x_base = ttnn.experimental.dit_minimal_matmul_addcmul_fused(
+                x, self.proj_w, 1.0, self.proj_c2, self.proj_gate,
+                bias_tensor=None, config=rt.dit_config, memory_config=mem, compute_kernel_config=rt.mm_compute,
+            )
+        else:
+            y = ttnn.linear(x, self.proj_w, bias=None, core_grid=_CORE_GRID, memory_config=mem)
+            y = ttnn.mul(y, self.proj_gate, memory_config=mem)
+            x_base = ttnn.add(y, self.proj_c2, memory_config=mem)
+        if cap:
+            cap("after_gaze_proj_pos", x_base, rows=self.num_patches)
+        return x_base
+
+    def _fused_decoder_graph(self, mask_dev, x_base, cap=None):
+        """(N, S, 1) mask + X_base -> head output(s): mul, add, 3 x 9-op gaze block, relu-linear,
+        fused head matmul (+ optional separate sigmoid) = 31-32 ops for any N (legacy 57 per head)."""
+        rt = self._rt
+        cfg = rt.cfg
+        mem = rt.mem
+        contrib = ttnn.mul(mask_dev, self.head_token_tt, memory_config=mem)  # (N, S, 256)
+        x = ttnn.add(contrib, x_base, memory_config=mem)                    # X_base broadcast over N
+        ttnn.deallocate(contrib)
+        if cap:
+            cap("after_head_conditioning", x, rows=self.num_patches, first=True)
+        for gp in self.gaze_block_params:
+            x = _fused_gaze_block(x, gp, rt, num_heads=8)
+        if cap:
+            cap("after_gaze_blocks", x, order="fused", first=True)
+
+        if cfg.head == "legacy":
+            h = ttnn.linear(x, self.inout_fc1_w, bias=self.inout_fc1_b, activation="relu", memory_config=mem)
+            h = ttnn.linear(h, self.inout_fc2_w, bias=self.inout_fc2_b, memory_config=mem)
+            io = ttnn.sigmoid(h, memory_config=mem)                                          # (N, S, 1)
+            hm = ttnn.linear(x, self.heatmap_w, bias=None, core_grid=_CORE_GRID, memory_config=mem)
+            hm = ttnn.add(hm, self.heatmap_b_tt, memory_config=mem)
+            hm = ttnn.sigmoid(hm, memory_config=mem)                                         # (N, S, 4)
+            return [hm, io]
+
+        h = ttnn.linear(x, self.inout_fc1_w, bias=self.inout_fc1_b, activation="relu", memory_config=mem)  # (N, S, 128)
+        act = rt.sigmoid_act if cfg.head == "fused" else None
+        out = ttnn.experimental.minimal_matmul(
+            [x, h], self.head_w, bias_tensor=self.head_b, fused_activation=act,
+            memory_config=mem, compute_kernel_config=rt.head_compute,
+        )  # (N, S, 5): K-concat 256 + 128 == 384 padded
+        ttnn.deallocate(h)
+        if act is None:
+            out = ttnn.sigmoid(out, memory_config=mem)
+        return [out]
+
+    # ------------------------------------------------------------------ trace plumbing
+    def _ensure_input_buffer(self):
+        if self._in_dev is None:
+            self._in_dev = ttnn.from_torch(
+                self._im2col_buf, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+
+    def _ensure_scene_trace(self):
+        if self._scene_trace is not None:
+            return
+        dev = self.device
+        self._ensure_input_buffer()
+        # Warm eager run: compiles every program so the capture only records dispatch.
+        xb = self._fused_scene_graph(self._in_dev)
+        ttnn.synchronize_device(dev)
+        ttnn.deallocate(xb)
+        tid = ttnn.begin_trace_capture(dev, cq_id=0)
+        try:
+            self._x_base = self._fused_scene_graph(self._in_dev)
+        except Exception:
+            # A capture left open hangs device close: end + release it before propagating.
+            ttnn.end_trace_capture(dev, tid, cq_id=0)
+            ttnn.release_trace(dev, tid)
+            raise
+        ttnn.end_trace_capture(dev, tid, cq_id=0)
+        ttnn.synchronize_device(dev)
+        self._scene_trace = tid
+
+    def _ensure_decoder_trace(self, n: int):
+        if n in self._dec:
+            return
+        self._ensure_scene_trace()
+        dev = self.device
+        mask_dev = ttnn.from_torch(
+            torch.zeros(n, self.seq_len, 1, dtype=torch.bfloat16), dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT, device=dev, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        outs = self._fused_decoder_graph(mask_dev, self._x_base)
+        ttnn.synchronize_device(dev)
+        for o in outs:
+            ttnn.deallocate(o)
+        tid = ttnn.begin_trace_capture(dev, cq_id=0)
+        try:
+            outs = self._fused_decoder_graph(mask_dev, self._x_base)
+        except Exception:
+            ttnn.end_trace_capture(dev, tid, cq_id=0)
+            ttnn.release_trace(dev, tid)
+            raise
+        ttnn.end_trace_capture(dev, tid, cq_id=0)
+        ttnn.synchronize_device(dev)
+        self._dec[n] = {"trace": tid, "mask": mask_dev, "outs": outs}
+
+    @property
+    def trace_buckets(self) -> List[int]:
+        return sorted(self._dec)
+
+    def warmup(self, heads: Optional[Sequence[int]] = None) -> None:
+        """Compile + capture everything the server needs BEFORE it reports READY.
+
+        Trace mode: the scene trace and one decoder trace per bucket in ``heads`` (default
+        ``TT_FUSED_TRACE_HEADS``). Eager mode: one eager forward (JIT). Idempotent.
+        """
+        if not self.fused:
+            return
+        if not self.fused_cfg.trace:
+            dummy = torch.zeros(1, 3, self.img_size, self.img_size, dtype=torch.float32)
+            self._run_eager(dummy, [WARMUP_BBOX])
+            return
+        self._ensure_scene_trace()
+        for n in sorted(set(int(h) for h in (heads or self.fused_cfg.trace_heads))):
+            self._ensure_decoder_trace(n)
+
+    def release_traces(self) -> None:
+        """Release captured traces (call before closing the device); buffers stay until GC."""
+        if not self.fused or not self.fused_cfg.trace:
+            return
+        for d in self._dec.values():
+            ttnn.release_trace(self.device, d["trace"])
+        self._dec.clear()
+        if self._scene_trace is not None:
+            ttnn.release_trace(self.device, self._scene_trace)
+            self._scene_trace = None
+            self._x_base = None
+
+    def fused_info(self) -> dict:
+        info = dict(self.fused_cfg.as_dict())
+        info.update(path=self.path, trace_buckets=self.trace_buckets, scene_traced=self._scene_trace is not None)
+        return info
+
+    # ------------------------------------------------------------------ execution
+    def _run_traced(self, images, bboxes):
+        n = len(bboxes)
+        bucket = pick_bucket(n, self.trace_buckets)
+        if bucket is None:
+            bucket = n  # not warmed for this many heads: capture lazily (seconds, once)
+        self._ensure_decoder_trace(bucket)
+        dev = self.device
+        d = self._dec[bucket]
+        # 1. im2col upload  2. scene trace  3. mask upload  4. decoder trace  5. readback (see class doc)
+        ttnn.copy_host_to_device_tensor(self._host_input(images), self._in_dev, cq_id=0)
+        ttnn.execute_trace(dev, self._scene_trace, cq_id=0, blocking=False)
+        ttnn.copy_host_to_device_tensor(self._host_mask(pad_bboxes(bboxes, bucket)), d["mask"], cq_id=0)
+        ttnn.execute_trace(dev, d["trace"], cq_id=0, blocking=False)
+        return [ttnn.to_torch(o).to(torch.float32) for o in d["outs"]]
+
+    def _run_eager(self, images, bboxes, cap=None):
+        """Same fused graph without a trace (TT_FUSED_EAGER=1, ``captures=``, warm-up)."""
+        dev = self.device
+        in_dev = ttnn.to_device(self._host_input(images), dev)
+        x_base = self._fused_scene_graph(in_dev, cap)
+        ttnn.deallocate(in_dev)
+        mask_dev = ttnn.to_device(self._host_mask(bboxes), dev)
+        if cap:
+            cap("head_map", mask_dev, rows=self.num_patches, first=True)
+        outs = self._fused_decoder_graph(mask_dev, x_base, cap)
+        res = [ttnn.to_torch(o).to(torch.float32) for o in outs]
+        for o in outs:
+            ttnn.deallocate(o)
+        ttnn.deallocate(mask_dev)
+        ttnn.deallocate(x_base)
+        return res
+
+    def _call_fused(self, images, bboxes, captures=None):
+        n = len(bboxes)
+        cfg = self.fused_cfg
+
+        def cap(key, tt, order=None, rows=None, first=False):
+            """Record a stage under its LEGACY name/shape so test_relative_pcc thresholds apply:
+            fused-order sequences are rotated back (special token to row 0), patch-only stages are
+            cut to the patch rows, batched stages to the first head."""
+            t = ttnn.to_torch(tt).to(torch.float32)
+            if first:
+                t = t[:1]
+            if rows is not None:
+                t = t[:, :rows]
+            if order == "fused":
+                t = fused_to_legacy_order(t)
+            captures[key] = t
+
+        if captures is not None or not cfg.trace:
+            outs = self._run_eager(images, bboxes, cap if captures is not None else None)
+        else:
+            outs = self._run_traced(images, bboxes)
+
+        fh, fw = self.featmap_h, self.featmap_w
+        if cfg.head == "legacy":
+            heatmap, inout = decode_legacy_head_outputs(outs[0], outs[1], fh, fw, n, self.out_size)
+        else:
+            heatmap, inout = decode_head_output(outs[0], fh, fw, n, self.out_size)
+        if captures is not None:
+            captures["heatmap_compact"] = outs[0][:1, : fh * fw, :4]
+            captures["inout_scalar"] = inout[:1]
+            captures["heatmap"] = heatmap[:1]
+        return {"heatmap": heatmap, "inout": inout}
+
+
+class TtGazeLLE(_FusedMixin):
     """Gaze-LLE inference entirely on a single Blackhole p150a chip (see module docstring)."""
 
     def __init__(self, ref_model, device, inout: bool = True):
@@ -194,6 +817,14 @@ class TtGazeLLE:
         self.featmap_h = ref_model.featmap_h
         self.featmap_w = ref_model.featmap_w
         self.out_size = ref_model.out_size
+
+        # TT_FUSED knob, read exactly once here. Default (unset/1) => fused; TT_FUSED=0 => the legacy path below, untouched.
+        self.fused_cfg = FusedConfig.from_env()
+        self.path = select_forward_path(self.fused_cfg, inout=inout, num_register_tokens=self.num_reg_tokens)
+        self.fused = self.path == "fused"
+        if self.fused:
+            self._init_fused(ref_model, device)
+            return
 
         self.block_params = [_BlockParams(blk, device) for blk in backbone.blocks]
         self.final_norm_w = _to_device(backbone.norm.weight.unsqueeze(0), device)
@@ -403,6 +1034,9 @@ class TtGazeLLE:
         b = images.shape[0]
         assert b == 1, "TtGazeLLE currently supports one image per forward (B=1)"
         assert len(bboxes) >= 1, "need at least one head bbox"
+
+        if self.fused:
+            return self._call_fused(images, bboxes, captures)
 
         def _capture(key, tt_tensor):
             if captures is not None:

@@ -173,7 +173,7 @@ def main() -> None:
 
     from gaze_lle.reference.load_pretrained import load_pretrained
     from gaze_lle.reference.torch_gaze_lle import build_gaze_lle
-    from gaze_lle.tt.tt_gaze_lle import TtGazeLLE
+    from gaze_lle.tt.tt_gaze_lle import TtGazeLLE, open_device_kwargs
 
     torch.manual_seed(0)
     torch.set_grad_enabled(False)
@@ -185,7 +185,7 @@ def main() -> None:
     samples = _load_samples_from_parquet(_PARQUET, _SAMPLE_INDICES)
 
     device_id = int(os.environ.get("GAZE_LLE_DEVICE", "0"))
-    d = ttnn.open_device(device_id=device_id)
+    d = ttnn.open_device(device_id=device_id, **open_device_kwargs())  # bare unless TT_FUSED=1
     try:
         tt_model = TtGazeLLE(ref, d, inout=True)
 

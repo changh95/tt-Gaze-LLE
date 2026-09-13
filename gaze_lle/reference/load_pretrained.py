@@ -27,8 +27,11 @@ import torch
 import torch.nn.functional as F
 
 # Default weight directory can be overridden with TT_GAZE_LLE_WEIGHTS. Defaults
-# to ./weights/ (what scripts/download_data.sh populates).
-_DEFAULT_WEIGHTS_DIR = os.environ.get("TT_GAZE_LLE_WEIGHTS", "./weights")
+# to ./weights/ (what scripts/download_data.sh populates). Read lazily so that
+# importing this module has no environment dependency (the server passes
+# explicit paths and never relies on the default).
+def _default_weights_dir() -> str:
+    return os.environ.get("TT_GAZE_LLE_WEIGHTS", "./weights")
 
 
 def _interpolate_pos_embed_2d(
@@ -147,9 +150,10 @@ def load_pretrained(
     ``$TT_GAZE_LLE_WEIGHTS`` (or ``./weights/`` if the env var is unset).
     """
     if dinov2_path is None:
-        dinov2_path = os.path.join(_DEFAULT_WEIGHTS_DIR, "dinov2_vitb14_pretrain.pth")
+        dinov2_path = os.path.join(_default_weights_dir(), "dinov2_vitb14_pretrain.pth")
     if gaze_path is None:
-        gaze_path = os.path.join(_DEFAULT_WEIGHTS_DIR, "gazelle_dinov2_vitb14_inout.pt")
-    dinov2_sd = torch.load(dinov2_path, map_location="cpu", weights_only=False)
-    gaze_sd = torch.load(gaze_path, map_location="cpu", weights_only=False) if gaze_path else {}
+        gaze_path = os.path.join(_default_weights_dir(), "gazelle_dinov2_vitb14_inout.pt")
+    # Both files are plain state dicts (tensors only), so the safe unpickler suffices.
+    dinov2_sd = torch.load(dinov2_path, map_location="cpu", weights_only=True)
+    gaze_sd = torch.load(gaze_path, map_location="cpu", weights_only=True) if gaze_path else {}
     return load_gaze_lle_into_reference(ref_model, dinov2_sd, gaze_sd, verbose=verbose)
