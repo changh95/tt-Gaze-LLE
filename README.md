@@ -430,6 +430,22 @@ branch commit history that produced this repo.
 
 ---
 
+## Comparison with an RTX 5090 (same host, 2026-09-14)
+
+device forward, 1 head, 448×448, batch 1; ratio = p150a ms / GPU ms.
+
+| setting | ms | vs p150a |
+|---|---:|---|
+| p150a, bf16 fused traces (served `timing_ms.inference`, N=1) | 5.7 | — |
+| RTX 5090 fp32 strict | 9.2 | p150a 1.6× faster |
+| RTX 5090 bf16 autocast | 5.0 | GPU 1.1× |
+| RTX 5090 fp16 autocast | 5.8 | parity |
+| RTX 5090 bf16 + `torch.compile` (split form, PCC 0.9995) | 3.8 | GPU 1.5× |
+
+One of the ports where the p150a beats fp32-strict eager GPU outright; N=3 heads: p150a 6.4 ms.
+
+Methodology: same host, this repo's torch reference (same weights and preprocessing as the served p150a path) run eagerly in PyTorch 2.11 cu128 (fp32 weights + `torch.autocast` unless stated; no TensorRT), batch 1, medians of 50 iterations after warm-up, H2D/D2H included; GPU fp32 output matches the CPU fp32 reference (PCC 1.0). p150a rows are the served bf16 fused path incl. upload/readback. p150a power was not measured, so no efficiency comparison is made. Full per-precision table, power and memory: [`GPU_COMPARISON.md`](GPU_COMPARISON.md).
+
 ## License
 
 Apache 2.0 (matches the upstream Gaze-LLE, DINOv2, and tt-metal licenses).
